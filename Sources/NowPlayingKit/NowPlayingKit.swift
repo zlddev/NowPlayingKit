@@ -149,10 +149,10 @@ public final class NowPlayingManager: @unchecked Sendable {
 
             var id = ""
             let title = entry.title
-            let artworkURL = entry.artwork?.url(width: 300, height: 300)
             var artist = ""
             var album: String? = nil
             var duration: TimeInterval = 1
+            var catalogArtwork: MusicKit.Artwork? = nil
 
             if let item = entry.item {
                 switch item {
@@ -161,13 +161,37 @@ public final class NowPlayingManager: @unchecked Sendable {
                     duration = song.duration ?? 1
                     artist = song.artistName
                     album = song.albumTitle
+                    catalogArtwork = song.artwork
                 case .musicVideo(let musicVideo):
                     id = musicVideo.id.rawValue
                     duration = musicVideo.duration ?? 1
                     artist = musicVideo.artistName
+                    catalogArtwork = musicVideo.artwork
                 @unknown default:
                     duration = 1
                 }
+            }
+
+            // Prefer the catalog item's own artwork (a real https CDN URL)
+            // over the queue entry's artwork. For tracks in the user's
+            // personal library, `entry.artwork` frequently resolves to a
+            // private `musicKit://artwork/library/...` reference that only
+            // MusicKit's on-device renderer (e.g. SwiftUI's ArtworkImage)
+            // can load — not a fetchable network URL, so it just hangs for
+            // AsyncImage or any remote consumer (like Discord Rich Presence).
+            let candidateURL =
+                catalogArtwork?.url(width: 300, height: 300)
+                ?? entry.artwork?.url(width: 300, height: 300)
+            let artworkURL = candidateURL.flatMap { url -> URL? in
+                guard let scheme = url.scheme?.lowercased(),
+                    scheme == "http" || scheme == "https"
+                else {
+                    print(
+                        "⚠️ Ignoring non-network artwork URL (scheme: \(url.scheme ?? "none")): \(url.absoluteString)"
+                    )
+                    return nil
+                }
+                return url
             }
 
             return NowPlayingData(
