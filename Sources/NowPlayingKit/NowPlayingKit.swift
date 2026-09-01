@@ -52,7 +52,17 @@ public final class NowPlayingManager: @unchecked Sendable {
     #endif
 
     @Published public private(set) var isPlaying = false
-    
+
+    // Caches catalog-search fallback lookups (see resolveCatalogArtworkURL)
+    // so a track without a usable artwork URL doesn't re-search Apple
+    // Music's catalog on every ~1s playback poll. NSCache is thread-safe,
+    // which matters since this class is `@unchecked Sendable` and its
+    // methods can be called concurrently from multiple Tasks. NSCache can't
+    // store nil, so a "not found" result is cached as `notFoundSentinel`
+    // rather than skipping the cache entirely.
+    private let artworkLookupCache = NSCache<NSString, NSURL>()
+    private static let notFoundSentinel = NSURL(string: "x-irpc-not-found:")!
+
     // Publisher for immediate state changes
     private let playbackStateSubject = PassthroughSubject<Bool, Never>()
     public var playbackStatePublisher: AnyPublisher<Bool, Never> {
@@ -182,7 +192,7 @@ public final class NowPlayingManager: @unchecked Sendable {
             let candidateURL =
                 catalogArtwork?.url(width: 300, height: 300)
                 ?? entry.artwork?.url(width: 300, height: 300)
-            let artworkURL = candidateURL.flatMap { url -> URL? in
+            var artworkURL = candidateURL.flatMap { url -> URL? in
                 guard let scheme = url.scheme?.lowercased(),
                     scheme == "http" || scheme == "https"
                 else {
@@ -192,6 +202,15 @@ public final class NowPlayingManager: @unchecked Sendable {
                     return nil
                 }
                 return url
+            }
+
+            // Local-library tracks with no catalog match never get a
+            // network artwork URL from the queue entry itself — fall back
+            // to searching the Apple Music catalog by title/artist for a
+            // best-effort match with real https artwork, instead of
+            // shipping no artwork at all.
+            if artworkURL == nil, !id.isEmpty, !title.isEmpty {
+                artworkURL = await resolveCatalogArtworkURL(id: id, title: title, artist: artist)
             }
 
             return NowPlayingData(
@@ -207,7 +226,43 @@ public final class NowPlayingManager: @unchecked Sendable {
             throw NowPlayingError.unauthorized
         #endif
     }
-    
+
+    #if os(iOS)
+    /// Best-effort fallback for tracks whose queue entry has no fetchable
+    /// artwork URL (private on-device `musicKit://artwork/library/...`
+    /// references, which is what the personal library hands back for
+    /// tracks that aren't 1:1 matched to an Apple Music catalog item).
+    /// Searches the catalog by title/artist and uses the top match's
+    /// artwork — a heuristic, not a guaranteed-correct match, but far
+    /// better than shipping no artwork.
+    private func resolveCatalogArtworkURL(id: String, title: String, artist: String) async -> URL? {
+        let key = id as NSString
+        if let cached = artworkLookupCache.object(forKey: key) {
+            return cached === Self.notFoundSentinel ? nil : cached as URL
+        }
+
+        do {
+            var request = MusicCatalogSearchRequest(term: "\(title) \(artist)", types: [Song.self])
+            request.limit = 1
+            let response = try await request.response()
+            let resolved = response.songs.first?.artwork?.url(width: 300, height: 300)
+            artworkLookupCache.setObject(resolved.map { $0 as NSURL } ?? Self.notFoundSentinel, forKey: key)
+            if let resolved {
+                print("🖼️ Resolved catalog artwork for \(title): \(resolved.absoluteString)")
+            } else {
+                print("⚠️ No catalog match found for \(title) by \(artist)")
+            }
+            return resolved
+        } catch {
+            print("⚠️ Catalog artwork search failed for \(title): \(error.localizedDescription)")
+            // Deliberately not cached — a transient network/token failure
+            // shouldn't permanently blacklist this track for the rest of
+            // the session.
+            return nil
+        }
+    }
+    #endif
+
     deinit {
         #if os(iOS)
         NotificationCenter.default.removeObserver(self)
