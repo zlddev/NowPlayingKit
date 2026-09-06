@@ -63,6 +63,19 @@ public final class NowPlayingManager: @unchecked Sendable {
     private let artworkLookupCache = NSCache<NSString, NSURL>()
     private static let notFoundSentinel = NSURL(string: "x-irpc-not-found:")!
 
+    // Failures (e.g. `developerTokenRequestFailed` when MusicKit's catalog
+    // search can't be authorized) used to not be cached at all, so a track
+    // stuck in that state got re-searched — and re-failed — on every single
+    // ~1s playback poll for as long as it played. That's not a transient
+    // blip worth ignoring the cache for; it's a per-track condition that
+    // isn't going to resolve itself within the same song. Cache failures
+    // too, just for a much shorter window than successes, so a real
+    // recovery (network back, token now issuable) is picked up reasonably
+    // soon without hammering the catalog search every second.
+    private var failedLookups: [String: Date] = [:]
+    private let failedLookupCooldown: TimeInterval = 60
+    private let failedLookupsLock = NSLock()
+
     // Publisher for immediate state changes
     private let playbackStateSubject = PassthroughSubject<Bool, Never>()
     public var playbackStatePublisher: AnyPublisher<Bool, Never> {
@@ -241,12 +254,22 @@ public final class NowPlayingManager: @unchecked Sendable {
             return cached === Self.notFoundSentinel ? nil : cached as URL
         }
 
+        failedLookupsLock.lock()
+        if let failedAt = failedLookups[id], Date().timeIntervalSince(failedAt) < failedLookupCooldown {
+            failedLookupsLock.unlock()
+            return nil
+        }
+        failedLookupsLock.unlock()
+
         do {
             var request = MusicCatalogSearchRequest(term: "\(title) \(artist)", types: [Song.self])
             request.limit = 1
             let response = try await request.response()
             let resolved = response.songs.first?.artwork?.url(width: 300, height: 300)
             artworkLookupCache.setObject(resolved.map { $0 as NSURL } ?? Self.notFoundSentinel, forKey: key)
+            failedLookupsLock.lock()
+            failedLookups.removeValue(forKey: id)
+            failedLookupsLock.unlock()
             if let resolved {
                 print("🖼️ Resolved catalog artwork for \(title): \(resolved.absoluteString)")
             } else {
@@ -255,9 +278,15 @@ public final class NowPlayingManager: @unchecked Sendable {
             return resolved
         } catch {
             print("⚠️ Catalog artwork search failed for \(title): \(error.localizedDescription)")
-            // Deliberately not cached — a transient network/token failure
-            // shouldn't permanently blacklist this track for the rest of
-            // the session.
+            // Not cached in the long-lived success cache — a fixable
+            // failure (network back, token now issuable) shouldn't be
+            // permanently blacklisted for the rest of the session — but do
+            // hold off retrying this exact track for `failedLookupCooldown`
+            // so a persistent failure (e.g. no MusicKit developer token
+            // configured at all) doesn't get re-attempted every ~1s poll.
+            failedLookupsLock.lock()
+            failedLookups[id] = Date()
+            failedLookupsLock.unlock()
             return nil
         }
     }
