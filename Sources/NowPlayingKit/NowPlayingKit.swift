@@ -254,12 +254,13 @@ public final class NowPlayingManager: @unchecked Sendable {
             return cached === Self.notFoundSentinel ? nil : cached as URL
         }
 
-        failedLookupsLock.lock()
-        if let failedAt = failedLookups[id], Date().timeIntervalSince(failedAt) < failedLookupCooldown {
-            failedLookupsLock.unlock()
-            return nil
+        let isCoolingDown = failedLookupsLock.withLock {
+            if let failedAt = failedLookups[id], Date().timeIntervalSince(failedAt) < failedLookupCooldown {
+                return true
+            }
+            return false
         }
-        failedLookupsLock.unlock()
+        if isCoolingDown { return nil }
 
         do {
             var request = MusicCatalogSearchRequest(term: "\(title) \(artist)", types: [Song.self])
@@ -267,9 +268,7 @@ public final class NowPlayingManager: @unchecked Sendable {
             let response = try await request.response()
             let resolved = response.songs.first?.artwork?.url(width: 300, height: 300)
             artworkLookupCache.setObject(resolved.map { $0 as NSURL } ?? Self.notFoundSentinel, forKey: key)
-            failedLookupsLock.lock()
-            failedLookups.removeValue(forKey: id)
-            failedLookupsLock.unlock()
+            failedLookupsLock.withLock { failedLookups.removeValue(forKey: id) }
             if let resolved {
                 print("🖼️ Resolved catalog artwork for \(title): \(resolved.absoluteString)")
             } else {
@@ -284,9 +283,7 @@ public final class NowPlayingManager: @unchecked Sendable {
             // hold off retrying this exact track for `failedLookupCooldown`
             // so a persistent failure (e.g. no MusicKit developer token
             // configured at all) doesn't get re-attempted every ~1s poll.
-            failedLookupsLock.lock()
-            failedLookups[id] = Date()
-            failedLookupsLock.unlock()
+            failedLookupsLock.withLock { failedLookups[id] = Date() }
             return nil
         }
     }
